@@ -127,4 +127,4 @@ docker compose down
 
 ## License
 
-現在、このリポジトリにはオープンソースライセンスを付けていません。
+このプロジェクトは [MIT License](LICENSE) の下で公開されています。VOICEVOX Engineおよび音声ライブラリには、それぞれ別の利用条件が適用されます。
