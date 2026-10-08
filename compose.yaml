@@ -1,0 +1,31 @@
+services:
+  discord-tts-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - speech-cache:/app/cache
+    ports:
+      - "${STREAM_BIND_ADDRESS:-127.0.0.1}:${STREAM_PORT:-3100}:3000"
+    expose:
+      - "3000"
+    depends_on:
+      - voicevox
+    networks:
+      - kuma-shared
+
+  voicevox:
+    image: voicevox/voicevox_engine:cpu-ubuntu24.04-latest
+    restart: unless-stopped
+    expose:
+      - "50021"
+    networks:
+      - kuma-shared
+
+networks:
+  kuma-shared:
+    external: true
+    name: ${KUMA_DOCKER_NETWORK:-uptime-kuma-tts}
+
+volumes:
+  speech-cache:
