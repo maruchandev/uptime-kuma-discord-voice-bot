@@ -40,6 +40,8 @@ const config = {
   timezone: process.env.TIMEZONE || "Asia/Tokyo",
   dedupMs: numberEnv("DEDUP_SECONDS", 60) * 1000,
   maxQueueSize: numberEnv("MAX_QUEUE_SIZE", 30),
+  batchWindowMs: numberEnv("ALERT_BATCH_WINDOW_SECONDS", 5) * 1000,
+  batchThreshold: numberEnv("ALERT_BATCH_THRESHOLD", 3),
   readingMap: parseJsonEnv("READING_MAP_JSON", {}),
 };
 const defaultReadingMap = { ...config.readingMap };
@@ -63,12 +65,14 @@ const clipPromises = new Map();
 const recentAlerts = new Map();
 const audioFiles = new Map();
 const streamClients = new Set();
+const pendingSpeechAlerts = [];
 let synthesisActive = false;
 let playbackActive = false;
 let audioSequence = 0;
 let cacheWarmup = { done: 0, total: 0, ready: false };
 let textChannel;
 let voiceConnection;
+let alertBatchTimer = null;
 
 client.once("clientReady", async () => {
   const voiceChannel = await client.channels.fetch(config.voiceChannelId);
@@ -111,6 +115,7 @@ app.get("/health", (_req, res) => {
     discord: client.isReady(),
     voice: voiceConnection?.state.status || "not-created",
     queue: speechQueue.length + generatedAudioQueue.length,
+    batching: pendingSpeechAlerts.length,
     synthesizing: synthesisActive,
     playing: playbackActive,
     speechCache: cacheWarmup,
@@ -205,8 +210,8 @@ app.post("/alert", authenticateWebhook, async (req, res) => {
 
   try {
     if (textChannel) await textChannel.send({ embeds: [buildEmbed(alert)] });
-    enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert));
-    res.status(202).json({ accepted: true });
+    enqueueAlertSpeech(alert);
+    res.status(202).json({ accepted: true, batching: true });
   } catch (error) {
     console.error("Alert handling failed", error);
     res.status(502).json({ error: "Discord delivery failed" });
@@ -419,6 +424,84 @@ function applyReadingMap(text) {
   );
 }
 
+function enqueueAlertSpeech(alert) {
+  if (alert.status !== "down" && alert.status !== "up") {
+    enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert));
+    return;
+  }
+  pendingSpeechAlerts.push(alert);
+  if (!alertBatchTimer) {
+    alertBatchTimer = setTimeout(flushAlertSpeechBatch, config.batchWindowMs);
+  }
+}
+
+function flushAlertSpeechBatch() {
+  alertBatchTimer = null;
+  const received = pendingSpeechAlerts.splice(0);
+  if (received.length === 0) return;
+
+  // If a device changes state more than once in the window, announce only its latest state.
+  const latestByMonitor = new Map();
+  for (const alert of received) {
+    const key = String(alert.monitor.id || alert.monitor.name || alert.name);
+    latestByMonitor.set(key, alert);
+  }
+
+  for (const status of ["down", "up"]) {
+    const alerts = [...latestByMonitor.values()].filter((alert) => alert.status === status);
+    if (alerts.length === 0) continue;
+    if (alerts.length < config.batchThreshold) {
+      for (const alert of alerts) {
+        enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert));
+      }
+      continue;
+    }
+    enqueueSpeech(buildBatchSpeech(status, alerts), config.speakerId, buildBatchSpeechSegments(status, alerts));
+    console.log("Batched " + alerts.length + " " + status + " alerts into one announcement");
+  }
+}
+
+function batchBreakdown(alerts) {
+  const rooms = new Map();
+  let otherCount = 0;
+  for (const alert of alerts) {
+    const room = String(alert.name).match(/-V(\d{3,4})-/)?.[1];
+    if (room) rooms.set(room, (rooms.get(room) || 0) + 1);
+    else otherCount += 1;
+  }
+  const details = [...rooms.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([room, count]) => "ブイ" + Number(room) + "教室、" + count + "件");
+  if (otherCount > 0) details.push("教室外の機器、" + otherCount + "件");
+  return details;
+}
+
+function buildBatchSpeech(status, alerts) {
+  const details = batchBreakdown(alerts).join("。");
+  if (status === "down") {
+    return "警告です。障害を" + alerts.length + "件検知しました。" + details + "。詳細は監視画面を確認してください。";
+  }
+  const latencies = alerts.map((alert) => Number(alert.heartbeat?.ping)).filter((value) => Number.isFinite(value) && value >= 0);
+  const latency = latencies.length > 0
+    ? "平均応答時間は、" + Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length) + "ミリ秒です。"
+    : "";
+  return "復旧のお知らせです。" + alerts.length + "件の復旧を確認しました。" + details + "。" + latency;
+}
+
+function buildBatchSpeechSegments(status, alerts) {
+  const details = batchBreakdown(alerts).map((detail) => detail + "。");
+  if (status === "down") {
+    return ["警告です。障害を" + alerts.length + "件検知しました。", ...details, "詳細は監視画面を確認してください。"];
+  }
+  const latencies = alerts.map((alert) => Number(alert.heartbeat?.ping)).filter((value) => Number.isFinite(value) && value >= 0);
+  const segments = ["復旧のお知らせです。" + alerts.length + "件の復旧を確認しました。", ...details];
+  if (latencies.length > 0) {
+    const average = Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length);
+    segments.push("平均応答時間は、" + average + "ミリ秒です。");
+  }
+  return segments;
+}
+
 function enqueueSpeech(text, speakerId = config.speakerId, segments = null) {
   if (speechQueue.length + generatedAudioQueue.length >= config.maxQueueSize) {
     console.warn("Speech queue is full; dropping oldest alert");
@@ -440,13 +523,11 @@ async function processSynthesisQueue() {
         let wav;
         let cached = false;
         if (segments) {
-          const clips = await Promise.all(segments.map((part) => readCachedClip(part, speakerId)));
-          if (clips.every(Boolean)) {
-            wav = concatenateWavs(clips);
-            cached = true;
-          }
+          const clips = await Promise.all(segments.map((part) => getOrCreateClip(part, speakerId)));
+          wav = concatenateWavs(clips);
+          cached = true;
         }
-        if (!wav) wav = await synthesize(text, speakerId);
+        if (!wav) wav = await getOrCreateClip(text, speakerId);
         publishAudio(wav, text);
         generatedAudioQueue.push({ wav, text });
         console.log(`${cached ? "Assembled cached audio" : "Synthesized"} in ${Math.round(performance.now() - startedAt)} ms; ready=${generatedAudioQueue.length}`);
@@ -504,6 +585,7 @@ function streamStatus() {
     discordReady: client.isReady(),
     voice: voiceConnection?.state.status || "not-connected",
     queue: speechQueue.length + generatedAudioQueue.length,
+    batching: pendingSpeechAlerts.length,
     synthesizing: synthesisActive,
     playing: playbackActive,
   };
@@ -525,19 +607,50 @@ section{margin-top:30px;padding:24px;border:1px solid #263449;border-radius:18px
 <div class="row" id="state"><span id="dot"></span><span id="status">接続中</span></div>
 <button id="start">このページで聞く（ブラウザ再生を有効化）</button><p class="muted">Discord VC接続と、このページで聞くためのブラウザ再生は別設定です。ページ内で音声を聞く場合だけ、最初に一度押してください。</p>
 <div id="log">通知待機中です。</div><audio id="audio" controls></audio>
-<section class="dict-panel"><div class="dict-heading"><div><h2>読み上げ辞書</h2><p class="hint">Uptime Kumaの監視名と、読み上げたい名前を登録します。保存すると障害・復旧の名前音声を準備します。</p></div><span class="dict-count" id="entryCount">辞書</span></div>
-<div class="dict-toolbar"><div class="dict-actions"><button class="secondary" id="loadDict">再読み込み</button><button class="secondary" id="addDict">＋ 単語を追加</button><button class="secondary" id="importCsv">CSVを読み込む</button><input id="csvFile" type="file" accept=".csv,text/csv" hidden><a class="csv-link" href="data:text/csv;charset=utf-8,%EF%BB%BFmonitor_name%2Creading%0Ahost-01%2C%E3%83%9B%E3%82%B9%E3%83%88%E3%82%BC%E3%83%AD%E3%83%AF%E3%83%B3%0A" download="reading-map-template.csv">ひな形</a></div><button class="save-button" id="saveDict">変更を保存</button></div><div id="dictStatus" class="dict-status" role="status" aria-live="polite"></div>
+<section class="dict-panel"><div class="dict-heading"><div><h2>機器名の読み方</h2><p class="hint">Uptime Kumaの監視名と、読み上げたい名前を登録します。例：<code>router-01</code> → <code>ルーターゼロワン</code>。保存すると障害・復旧の名前音声を準備します。</p></div><span class="dict-count" id="entryCount">辞書</span></div>
+<div class="dict-toolbar"><div class="dict-actions"><button class="secondary" id="loadDict">再読み込み</button><button class="secondary" id="addDict">＋ 単語を追加</button><button class="secondary" id="importCsv">CSVを読み込む</button><input id="csvFile" type="file" accept=".csv,text/csv" hidden><a class="csv-link" href="data:text/csv;charset=utf-8,%EF%BB%BFmonitor_name%2Creading%0Arouter-01%2C%E3%83%AB%E3%83%BC%E3%82%BF%E3%83%BC%E3%82%BC%E3%83%AD%E3%83%AF%E3%83%B3%0A" download="reading-map-template.csv">ひな形</a></div><button class="save-button" id="saveDict">変更を保存</button></div><div id="dictStatus" class="dict-status" role="status" aria-live="polite"></div>
 <div class="dict-list"><div class="dict-head"><span>監視名</span><span>読み上げる名前</span><span>音声キャッシュ</span><span>試聴</span><span></span></div><div id="dictRows"></div></div></section>
 <script>
 const audio=document.querySelector('#audio'),log=document.querySelector('#log'),state=document.querySelector('#state'),status=document.querySelector('#status');let enabled=false,discordReady=false;
-document.querySelector('#start').onclick=()=>{enabled=true;status.textContent='ブラウザ再生有効（通知待機中）';state.classList.add('ready');};
+const browserAudioQueue=[];let currentAudioItem=null,autoplayBlocked=false;
+function updatePlaybackStatus(){
+  const connection=discordReady?'Discord VC接続済み':'Discord VC未接続';
+  status.textContent=autoplayBlocked?'再生を開始できません。「このページで聞く」かプレイヤーの再生を押してください':enabled?'ブラウザ再生有効・'+connection+'（'+(currentAudioItem?'再生中・':'')+'待機 '+browserAudioQueue.length+'件）':connection+'（ブラウザ再生待機 '+browserAudioQueue.length+'件）';
+  state.classList.toggle('ready',enabled);
+}
+function releaseAudioItem(item){if(item.objectUrl)URL.revokeObjectURL(item.objectUrl)}
+async function playCurrentAudio(){
+  if(!currentAudioItem)return;
+  const item=currentAudioItem;
+  try{await audio.play();if(currentAudioItem===item){autoplayBlocked=false;updatePlaybackStatus()}}
+  catch(error){if(currentAudioItem===item){autoplayBlocked=true;updatePlaybackStatus()}}
+}
+function playNextAudio(){
+  if(!enabled||currentAudioItem)return;
+  while(browserAudioQueue.length&&browserAudioQueue[0].failed){releaseAudioItem(browserAudioQueue.shift())}
+  if(!browserAudioQueue.length||!browserAudioQueue[0].ready){updatePlaybackStatus();return}
+  currentAudioItem=browserAudioQueue.shift();log.textContent=currentAudioItem.text;audio.src=currentAudioItem.objectUrl;updatePlaybackStatus();void playCurrentAudio();
+}
+function finishCurrentAudio(){
+  if(!currentAudioItem)return;
+  releaseAudioItem(currentAudioItem);currentAudioItem=null;autoplayBlocked=false;playNextAudio();updatePlaybackStatus();
+}
+function enqueueBrowserAudio(item){browserAudioQueue.push(item);updatePlaybackStatus();playNextAudio()}
+audio.addEventListener('ended',finishCurrentAudio);
+audio.addEventListener('error',()=>{if(currentAudioItem){log.textContent='音声を再生できませんでした。'+currentAudioItem.text;finishCurrentAudio()}});
+audio.addEventListener('play',()=>{autoplayBlocked=false;updatePlaybackStatus()});
+document.querySelector('#start').onclick=()=>{enabled=true;updatePlaybackStatus();if(currentAudioItem)void playCurrentAudio();else playNextAudio()};
 const events=new EventSource('/stream/events');
-events.addEventListener('status',e=>{const s=JSON.parse(e.data);discordReady=s.discordReady;if(enabled){status.textContent=discordReady?'ブラウザ再生有効・Discord VC接続済み':'ブラウザ再生有効・Discord VC未接続';state.classList.add('ready')}else{status.textContent=discordReady?'Discord VC接続済み（このページでは未再生）':'未接続（このページで聞くには下のボタン）';state.classList.remove('ready')}});
-events.addEventListener('audio',async e=>{const item=JSON.parse(e.data);log.textContent=item.text;audio.src=item.url+'?t='+Date.now();if(enabled){try{await audio.play()}catch(err){status.textContent='自動再生できません。音声プレイヤーの再生を押してください'}}else{status.textContent=discordReady?'Discord VCへ送信済み・このページでは未再生':'通知受信済み（このページで聞くには下のボタン）'}});
-events.onerror=()=>{status.textContent='再接続中';state.classList.remove('ready')};
-const rows=document.querySelector('#dictRows'),dictStatus=document.querySelector('#dictStatus'),entryCount=document.querySelector('#entryCount');let currentPreviewUrl=null;
+events.addEventListener('status',e=>{discordReady=JSON.parse(e.data).discordReady;updatePlaybackStatus()});
+events.addEventListener('audio',e=>{
+  const item={...JSON.parse(e.data),ready:false,failed:false};enqueueBrowserAudio(item);
+  // Fetch immediately so waiting notifications survive eviction from the server's short audio cache.
+  fetch(item.url).then(response=>{if(!response.ok)throw new Error('Audio download failed');return response.blob()}).then(blob=>{item.objectUrl=URL.createObjectURL(blob);item.ready=true;playNextAudio()}).catch(error=>{item.failed=true;playNextAudio()});
+});
+events.onerror=()=>{status.textContent='再接続中（待機 '+browserAudioQueue.length+'件）';state.classList.remove('ready')};
+const rows=document.querySelector('#dictRows'),dictStatus=document.querySelector('#dictStatus'),entryCount=document.querySelector('#entryCount');
 function updateEntryCount(){entryCount.textContent=rows.children.length+'件'}
-function addRow(word='',reading='',cache={}){const row=document.createElement('div');row.className='dict-row';const wordInput=document.createElement('input');wordInput.value=word;wordInput.placeholder='例：host-01';const readingInput=document.createElement('input');readingInput.value=reading;readingInput.placeholder='例：ホストゼロワン';const state=document.createElement('span');state.className='cache-state';const refreshState=()=>{state.textContent='障害 '+(cache.down?'✓':'–')+' / 復旧 '+(cache.up?'✓':'–');state.classList.toggle('complete',cache.down&&cache.up)};refreshState();readingInput.oninput=()=>{cache={down:false,up:false};refreshState()};const preview=document.createElement('button');preview.className='preview-button';preview.textContent='▶';preview.title='障害通知の名前部分を試聴';preview.setAttribute('aria-label','読み上げを試聴');preview.onclick=async()=>{if(!readingInput.value.trim()){dictStatus.textContent='先に読み上げる名前を入力してください';return}try{dictStatus.textContent='試聴音声を準備中…';const response=await fetch('/api/reading-map/preview?reading='+encodeURIComponent(readingInput.value.trim()));if(!response.ok)throw new Error('試聴音声を作成できませんでした');if(currentPreviewUrl)URL.revokeObjectURL(currentPreviewUrl);currentPreviewUrl=URL.createObjectURL(await response.blob());audio.src=currentPreviewUrl;await audio.play();cache.down=true;refreshState();dictStatus.textContent='障害通知の名前部分を再生しています'}catch(error){dictStatus.textContent=error.message}};const remove=document.createElement('button');remove.className='delete-button';remove.textContent='×';remove.title='この単語を削除';remove.setAttribute('aria-label','この単語を削除');remove.onclick=()=>{row.remove();updateEntryCount()};row.append(wordInput,readingInput,state,preview,remove);rows.append(row);updateEntryCount()}
+function addRow(word='',reading='',cache={}){const row=document.createElement('div');row.className='dict-row';const wordInput=document.createElement('input');wordInput.value=word;wordInput.placeholder='例：router-01';const readingInput=document.createElement('input');readingInput.value=reading;readingInput.placeholder='例：ルーターゼロワン';const state=document.createElement('span');state.className='cache-state';const refreshState=()=>{state.textContent='障害 '+(cache.down?'✓':'–')+' / 復旧 '+(cache.up?'✓':'–');state.classList.toggle('complete',cache.down&&cache.up)};refreshState();readingInput.oninput=()=>{cache={down:false,up:false};refreshState()};const preview=document.createElement('button');preview.className='preview-button';preview.textContent='▶';preview.title='障害通知の名前部分を試聴';preview.setAttribute('aria-label','読み上げを試聴');preview.onclick=async()=>{if(!readingInput.value.trim()){dictStatus.textContent='先に読み上げる名前を入力してください';return}try{dictStatus.textContent='試聴音声を準備中…';const response=await fetch('/api/reading-map/preview?reading='+encodeURIComponent(readingInput.value.trim()));if(!response.ok)throw new Error('試聴音声を作成できませんでした');const objectUrl=URL.createObjectURL(await response.blob());enqueueBrowserAudio({text:'読み方の試聴：'+readingInput.value.trim(),objectUrl,ready:true});cache.down=true;refreshState();dictStatus.textContent='試聴音声を再生待ちに追加しました'}catch(error){dictStatus.textContent=error.message}};const remove=document.createElement('button');remove.className='delete-button';remove.textContent='×';remove.title='この単語を削除';remove.setAttribute('aria-label','この単語を削除');remove.onclick=()=>{row.remove();updateEntryCount()};row.append(wordInput,readingInput,state,preview,remove);rows.append(row);updateEntryCount()}
 async function dictRequest(method='GET',body){const response=await fetch('/api/reading-map',{method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});const data=await response.json();if(!response.ok)throw new Error(data.error||'辞書の操作に失敗しました');return data}
 document.querySelector('#loadDict').onclick=async()=>{try{dictStatus.textContent='読み込み中…';const data=await dictRequest();rows.replaceChildren();Object.entries(data.entries).sort(([a],[b])=>a.localeCompare(b,'ja')).forEach(([word,reading])=>addRow(word,reading,data.cacheStatus[word]));dictStatus.textContent=Object.keys(data.entries).length+'件読み込みました'}catch(error){dictStatus.textContent=error.message}};
 document.querySelector('#addDict').onclick=()=>addRow();
@@ -646,6 +759,7 @@ async function warmSpeechCache() {
     ...Array.from({ length: 59 }, (_, index) => `${index + 1}分です。`),
   ]);
   for (const name of Object.values(config.readingMap)) {
+    phrases.add(name + "。");
     phrases.add(`警告です。${name}で障害を検知しました。`);
     phrases.add(`復旧です。${name}は正常な状態に戻りました。`);
   }
