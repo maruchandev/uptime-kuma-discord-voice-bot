@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f4f6f8">
+  <title>音声通知 | Uptime Kuma</title>
+  <link rel="stylesheet" href="/stream-assets/stream.css?v=group-status-2">
+  <script src="/stream-assets/stream.js?v=group-status-2" defer></script>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="app-header">
+      <div class="brand-block">
+        <p class="eyebrow">NETWORK OPERATIONS</p>
+        <h1>音声通知</h1>
+      </div>
+      <nav class="primary-nav" aria-label="メインナビゲーション">
+        <a class="nav-link active" href="/stream" aria-current="page">運用</a>
+        <a class="nav-link" href="/stream/dictionary">読み上げ辞書</a>
+      </nav>
+    </header>
+
+    <div class="ops-grid">
+      <section class="panel live-panel" aria-labelledby="live-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">LATEST EVENT</p>
+            <h2 id="live-heading">最新の通知</h2>
+          </div>
+          <div id="state" class="connection-pill">
+            <span id="dot" class="connection-dot" aria-hidden="true"></span>
+            <span id="status">待機中</span>
+          </div>
+        </div>
+        <div id="log" class="notification" aria-live="polite">
+          <strong id="notificationTitle">通知を待っています</strong>
+          <div id="notificationDetails" class="notification-details"></div>
+        </div>
+      </section>
+
+      <section class="panel playback-panel" aria-labelledby="playback-heading">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PLAYBACK</p>
+            <h2 id="playback-heading">再生状態</h2>
+          </div>
+          <button id="start" class="primary-button" type="button">再生を有効にする</button>
+        </div>
+        <div class="status-grid">
+          <div class="status-card">
+            <span>Discord</span>
+            <strong id="discordStatus">接続を確認中</strong>
+          </div>
+          <div class="status-card">
+            <span>ブラウザー音声</span>
+            <strong id="browserStatus">未接続</strong>
+          </div>
+          <div class="status-card">
+            <span>再生待ち</span>
+            <strong id="queueCount">0件</strong>
+          </div>
+        </div>
+        <p class="helper-text">初回のみ再生を有効にしてください。通知音声はHTTPで取得して順番に再生します。</p>
+        <audio id="audio" controls preload="none" aria-label="通知音声"></audio>
+      </section>
+    </div>
+
+    <section class="panel history-panel" aria-labelledby="history-heading">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">RECENT EVENTS</p>
+          <h2 id="history-heading">通知履歴</h2>
+        </div>
+        <span id="historyCount" class="subtle-label">0件</span>
+      </div>
+      <div class="history-table-wrap">
+        <table class="history-table">
+          <thead><tr><th scope="col">時刻</th><th scope="col">通知</th><th scope="col">内容</th></tr></thead>
+          <tbody id="historyList"><tr class="empty-row"><td colspan="3">通知はまだありません</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

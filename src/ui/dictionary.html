@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f4f6f8">
+  <title>読み上げ辞書 | Uptime Kuma</title>
+  <link rel="stylesheet" href="/stream-assets/stream.css?v=group-status-2">
+  <script src="/stream-assets/dictionary.js?v=group-status-2" defer></script>
+</head>
+<body>
+  <main class="app-shell dictionary-shell">
+    <header class="app-header">
+      <div class="brand-block">
+        <p class="eyebrow">VOICE SETTINGS</p>
+        <h1>読み上げ辞書</h1>
+      </div>
+      <nav class="primary-nav" aria-label="メインナビゲーション">
+        <a class="nav-link" href="/stream">運用</a>
+        <a class="nav-link active" href="/stream/dictionary" aria-current="page">読み上げ辞書</a>
+      </nav>
+    </header>
+
+    <section class="panel dictionary-panel" aria-labelledby="dictionary-heading">
+      <div class="panel-heading dictionary-heading">
+        <div>
+          <p class="eyebrow">PRONUNCIATION</p>
+          <h2 id="dictionary-heading">機器名の読み方</h2>
+          <p class="helper-text">監視名ごとの読みと、正規表現で監視名をまとめるグループ名をJSONで管理します。</p>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="toolbar-actions">
+          <button class="secondary-button" id="loadDict" type="button">再読み込み</button>
+          <button class="secondary-button" id="syncMonitors" type="button">監視対象を同期</button>
+          <button class="secondary-button" id="importJson" type="button">JSONファイルを読み込む</button>
+          <input id="jsonFile" type="file" accept=".json,application/json" hidden>
+          <a class="secondary-link" id="jsonTemplate" href="#" aria-disabled="true" download="reading-map.json" title="保存済み辞書をJSON形式でダウンロード">保存済みJSONをダウンロード</a>
+        </div>
+        <button class="primary-button" id="saveDict" type="button">JSONを保存</button>
+      </div>
+
+      <div id="dictStatus" class="inline-status" role="status" aria-live="polite"></div>
+      <div class="editor-shell">
+        <div class="editor-topbar">
+          <div class="editor-file"><span class="editor-file-mark" aria-hidden="true"></span><span>reading-map.json</span><span class="editor-language">JSON</span></div>
+          <div class="editor-state"><span id="entryCount" class="editor-count">— 件</span><span id="saveState" class="save-state">読込中</span></div>
+        </div>
+        <div class="editor-layout">
+          <section class="editor-main" aria-label="JSON編集">
+            <div class="editor-actionbar">
+              <span>保存済みの読みを直接編集</span>
+              <button class="format-button" id="formatJson" type="button">JSONを整形</button>
+            </div>
+            <div class="code-editor">
+              <pre class="line-numbers" id="lineNumbers" aria-hidden="true">1</pre>
+              <textarea id="jsonEditor" class="json-editor" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="読み上げ辞書JSON"></textarea>
+            </div>
+          </section>
+          <aside class="editor-guide" aria-label="JSONの書き方">
+            <p class="guide-label">FORMAT</p>
+            <h3>グループと読みを登録</h3>
+            <p>entriesの各監視名にreading（読み）とgroup（グループ名）を登録します。必要ならgroupsに正規表現の既定グループも設定できます。監視対象ごとのgroupが優先されます。</p>
+            <pre>{
+  "groups": {
+    "^CK-.*-V001-": "第1教室"
+  },
+  "entries": {
+    "CK-AP-V001-1": {
+      "reading": "アクセスポイント ブイゼロゼロイチ いち",
+      "group": "教室１０１"
+    }
+  }
+}</pre>
+            <div class="guide-note">entriesのgroupが空ならgroupsの正規表現を使います。以前の「監視名: 読み」形式も読み込めます。</div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel cache-panel" aria-labelledby="cache-heading">
+      <div class="panel-heading cache-heading">
+        <div>
+          <p class="eyebrow">AUDIO CACHE</p>
+          <h2 id="cache-heading">読み上げ音声の準備</h2>
+          <p class="helper-text">保存済みの各読みについて、障害・復旧の音声キャッシュ状態を表示します。</p>
+        </div>
+        <span id="cacheSummary" class="cache-summary">状態を確認中</span>
+      </div>
+      <div class="cache-progress-row">
+        <div class="cache-progress-track" role="progressbar" aria-label="音声キャッシュ生成状況" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+          <span id="cacheProgressFill"></span>
+        </div>
+        <span id="cacheProgressCount" class="cache-progress-count">0 / 0</span>
+      </div>
+      <p id="cacheNote" class="cache-note">読み上げ辞書を読み込んでいます。</p>
+      <div class="cache-table-wrap">
+        <table class="cache-table">
+          <thead><tr><th scope="col">監視名</th><th scope="col">読み</th><th scope="col">障害</th><th scope="col">復旧</th></tr></thead>
+          <tbody id="cacheRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel preview-panel" aria-labelledby="preview-heading">
+      <div>
+        <p class="eyebrow">PREVIEW</p>
+        <h2 id="preview-heading">読み方の試聴</h2>
+        <p class="helper-text">試聴する読みを入力して確認できます。</p>
+      </div>
+      <div class="preview-controls">
+        <input id="previewReading" type="text" placeholder="読み上げる文章" aria-label="試聴する読み">
+        <button class="secondary-button" id="previewButton" type="button">試聴</button>
+        <audio id="previewAudio" controls preload="none" aria-label="読み方の試聴音声"></audio>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

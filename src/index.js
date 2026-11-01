@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import express from "express";
+import { io as createSocketClient } from "socket.io-client";
 import {
   Client,
   EmbedBuilder,
@@ -21,6 +23,7 @@ import {
 
 const requiredEnv = ["WEBHOOK_TOKEN"];
 const clipCacheDir = "/app/cache";
+const uiDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "ui");
 
 for (const key of requiredEnv) {
   if (!process.env[key]) {
@@ -42,7 +45,12 @@ const config = {
   maxQueueSize: numberEnv("MAX_QUEUE_SIZE", 30),
   batchWindowMs: numberEnv("ALERT_BATCH_WINDOW_SECONDS", 5) * 1000,
   batchThreshold: numberEnv("ALERT_BATCH_THRESHOLD", 3),
+  kumaSocketUrl: process.env.KUMA_SOCKET_URL || "",
+  kumaUsername: process.env.KUMA_USERNAME || "",
+  kumaPassword: process.env.KUMA_PASSWORD || "",
   readingMap: parseJsonEnv("READING_MAP_JSON", {}),
+  groupMap: {},
+  monitorGroupMap: {},
 };
 const defaultReadingMap = { ...config.readingMap };
 const readingMapFile = path.join(clipCacheDir, "reading-map.json");
@@ -68,11 +76,17 @@ const streamClients = new Set();
 const pendingSpeechAlerts = [];
 let synthesisActive = false;
 let playbackActive = false;
+let queuePressureWarned = false;
 let audioSequence = 0;
 let cacheWarmup = { done: 0, total: 0, ready: false };
 let textChannel;
 let voiceConnection;
 let alertBatchTimer = null;
+let kumaSocket = null;
+let kumaSocketStatus = "not-configured";
+let kumaSocketError = "";
+let kumaMonitors = new Map();
+let kumaMonitorsSyncedAt = null;
 
 client.once("clientReady", async () => {
   const voiceChannel = await client.channels.fetch(config.voiceChannelId);
@@ -107,6 +121,7 @@ audioPlayer.on("error", (error) => console.error("Audio player error", error));
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
+app.use("/stream-assets", express.static(uiDir, { maxAge: "1h", fallthrough: false }));
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -122,12 +137,27 @@ app.get("/health", (_req, res) => {
   });
 });
 
+app.get(["/stream/dictionary", "/Stream/dictionary"], (_req, res) => {
+  res.set("cache-control", "no-cache").sendFile(path.join(uiDir, "dictionary.html"));
+});
+
 app.get(["/stream", "/Stream"], (_req, res) => {
-  res.type("html").send(streamPage());
+  res.set("cache-control", "no-cache").sendFile(path.join(uiDir, "stream.html"));
 });
 
 app.get("/api/reading-map", async (_req, res) => {
-  res.json({ entries: config.readingMap, cacheStatus: await readingMapCacheStatus(config.readingMap) });
+  res.json({ entries: structuredReadingEntries(), groups: config.groupMap, cacheStatus: await readingMapCacheStatus(config.readingMap) });
+});
+
+app.get("/api/monitors", (_req, res) => {
+  res.json({
+    configured: Boolean(config.kumaSocketUrl && config.kumaUsername && config.kumaPassword),
+    connected: kumaSocketStatus === "connected",
+    status: kumaSocketStatus,
+    error: kumaSocketError,
+    syncedAt: kumaMonitorsSyncedAt,
+    monitors: [...kumaMonitors.values()].sort((left, right) => left.name.localeCompare(right.name, "ja")),
+  });
 });
 
 app.get("/api/reading-map/preview", async (req, res) => {
@@ -144,31 +174,59 @@ app.get("/api/reading-map/preview", async (req, res) => {
 
 app.put("/api/reading-map", async (req, res) => {
   const entries = req.body?.entries;
+  const groups = req.body?.groups || {};
   if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
     return res.status(400).json({ error: "entries must be an object" });
   }
+  if (!groups || typeof groups !== "object" || Array.isArray(groups) || Object.keys(groups).length > 200) {
+    return res.status(400).json({ error: "groups must be an object with at most 200 rules" });
+  }
   const updated = {};
+  const updatedMonitorGroups = {};
   for (const [word, reading] of Object.entries(entries)) {
     const key = String(word).trim();
-    const value = String(reading).trim();
-    if (!key || !value || key.length > 100 || value.length > 200 || Object.keys(updated).length >= 100) {
-      return res.status(400).json({ error: "単語と読みを入力してください（各100/200文字以内、最大100件）" });
+    const value = String(typeof reading === "string" ? reading : reading?.reading || "").trim();
+    const rawGroup = typeof reading === "object" && reading ? (reading.group ?? "") : "";
+    if (typeof rawGroup !== "string") return res.status(400).json({ error: "グループ名は文字列で入力してください" });
+    const group = rawGroup.trim();
+    if (!key || !value || key.length > 100 || value.length > 200 || Object.keys(updated).length >= 500) {
+      return res.status(400).json({ error: "単語と読みを入力してください（各100/200文字以内、最大500件）" });
     }
+    if (group.length > 100) return res.status(400).json({ error: "グループ名は100文字以内にしてください" });
     updated[key] = value;
+    if (group) updatedMonitorGroups[key] = group;
+  }
+  const updatedGroups = {};
+  for (const [pattern, name] of Object.entries(groups)) {
+    if (!pattern || pattern.length > 200 || typeof name !== "string" || !name.trim() || name.length > 100) {
+      return res.status(400).json({ error: "グループの正規表現は200文字以内、名称は1〜100文字で入力してください" });
+    }
+    try {
+      new RegExp(pattern);
+    } catch {
+      return res.status(400).json({ error: `無効な正規表現です: ${pattern}` });
+    }
+    updatedGroups[pattern] = name.trim();
   }
 
   try {
     await fs.mkdir(clipCacheDir, { recursive: true });
     const temporary = `${readingMapFile}.${process.pid}.tmp`;
-    await fs.writeFile(temporary, `${JSON.stringify(updated, null, 2)}\n`, { mode: 0o600 });
+    const savedEntries = Object.fromEntries(Object.entries(updated).map(([name, reading]) => [name, {
+      reading,
+      group: updatedMonitorGroups[name] || "",
+    }]));
+    await fs.writeFile(temporary, `${JSON.stringify({ groups: updatedGroups, entries: savedEntries }, null, 2)}\n`, { mode: 0o600 });
     await fs.rename(temporary, readingMapFile);
     config.readingMap = updated;
+    config.groupMap = updatedGroups;
+    config.monitorGroupMap = updatedMonitorGroups;
     const phrases = [...new Set(Object.values(updated))].flatMap((name) => [
       `警告です。${name}で障害を検知しました。`,
       `復旧です。${name}は正常な状態に戻りました。`,
-    ]);
+    ]).concat(batchCachePhrases());
     for (const phrase of phrases) await getOrCreateClip(phrase);
-    res.json({ ok: true, entries: config.readingMap, cacheStatus: await readingMapCacheStatus(config.readingMap) });
+    res.json({ ok: true, entries: structuredReadingEntries(), groups: config.groupMap, cacheStatus: await readingMapCacheStatus(config.readingMap) });
   } catch (error) {
     console.error("Reading map save failed", error);
     res.status(500).json({ error: "保存または読み上げ音声の準備に失敗しました" });
@@ -240,6 +298,7 @@ app.use((error, _req, res, _next) => {
 app.listen(config.port, "0.0.0.0", () => {
   console.log(`Internal webhook listening on port ${config.port}`);
 });
+connectKumaMonitorSync();
 
 if (discordEnabled) {
   await client.login(process.env.DISCORD_BOT_TOKEN);
@@ -247,6 +306,94 @@ if (discordEnabled) {
   console.warn("Discord settings are incomplete; /stream mode only");
 }
 void warmSpeechCache();
+
+function connectKumaMonitorSync() {
+  if (!config.kumaSocketUrl || !config.kumaUsername || !config.kumaPassword) return;
+
+  let endpoint;
+  try {
+    endpoint = new URL(config.kumaSocketUrl);
+    if (!['http:', 'https:'].includes(endpoint.protocol)) throw new Error("Unsupported protocol");
+  } catch {
+    kumaSocketStatus = "configuration-error";
+    kumaSocketError = "KUMA_SOCKET_URL must be an http(s) URL";
+    console.error(kumaSocketError);
+    return;
+  }
+
+  kumaSocketStatus = "connecting";
+  kumaSocket = createSocketClient(endpoint.toString().replace(/\/$/, ""), {
+    reconnection: true,
+    timeout: 8000,
+  });
+
+  kumaSocket.on("connect", () => {
+    kumaSocketStatus = "authenticating";
+    kumaSocketError = "";
+    kumaSocket.emit("login", {
+      username: config.kumaUsername,
+      password: config.kumaPassword,
+    }, (result) => {
+      if (!result?.ok) {
+        kumaSocketStatus = result?.tokenRequired ? "two-factor-required" : "authentication-error";
+        kumaSocketError = result?.tokenRequired
+          ? "Uptime Kuma account requires 2FA; use a dedicated account without 2FA for this integration"
+          : "Uptime Kuma login failed; check KUMA_USERNAME and KUMA_PASSWORD";
+        console.error(kumaSocketError);
+        return;
+      }
+
+      kumaSocketStatus = "connected";
+      kumaSocket.emit("getMonitorList", (response) => {
+        if (!response?.ok) {
+          kumaSocketStatus = "sync-error";
+          kumaSocketError = "Uptime Kuma rejected getMonitorList";
+          console.error(kumaSocketError);
+        }
+      });
+    });
+  });
+
+  kumaSocket.on("monitorList", (list) => {
+    kumaMonitors = new Map(normalizeKumaMonitors(list).map((monitor) => [monitor.id, monitor]));
+    kumaMonitorsSyncedAt = new Date().toISOString();
+    kumaSocketStatus = "connected";
+    kumaSocketError = "";
+    console.log(`Uptime Kuma monitor list synchronized: ${kumaMonitors.size} monitors`);
+  });
+
+  kumaSocket.on("updateMonitorIntoList", (updates) => {
+    for (const monitor of normalizeKumaMonitors(updates)) kumaMonitors.set(monitor.id, monitor);
+    kumaMonitorsSyncedAt = new Date().toISOString();
+  });
+
+  kumaSocket.on("deleteMonitorFromList", (monitorId) => {
+    kumaMonitors.delete(String(monitorId));
+    kumaMonitorsSyncedAt = new Date().toISOString();
+  });
+
+  kumaSocket.on("disconnect", () => {
+    kumaSocketStatus = "disconnected";
+  });
+
+  kumaSocket.on("connect_error", (error) => {
+    kumaSocketStatus = "connection-error";
+    kumaSocketError = "Could not connect to Uptime Kuma Socket.IO";
+    console.error(kumaSocketError, error.message);
+  });
+}
+
+function normalizeKumaMonitors(list) {
+  if (!list || typeof list !== "object" || Array.isArray(list)) return [];
+  return Object.entries(list)
+    .map(([key, value]) => ({
+      id: String(value?.id ?? key),
+      name: String(value?.name || "").trim(),
+      active: value?.active !== false,
+      type: String(value?.type || ""),
+    }))
+    .filter((monitor) => monitor.id && monitor.name && monitor.type !== "group");
+}
 
 function authenticateWebhook(req, res, next) {
   const supplied = req.get("x-webhook-token") || "";
@@ -263,14 +410,38 @@ async function loadSavedReadingMap() {
   try {
     const saved = JSON.parse(await fs.readFile(readingMapFile, "utf8"));
     if (!saved || typeof saved !== "object" || Array.isArray(saved)) throw new Error("Invalid reading map");
-    config.readingMap = Object.fromEntries(
-      Object.entries(saved).filter(([word, reading]) =>
-        typeof word === "string" && typeof reading === "string" && word.trim() && reading.trim()),
-    );
+    const structured = saved.entries && typeof saved.entries === "object" && !Array.isArray(saved.entries);
+    const entries = structured ? saved.entries : saved;
+    const groups = structured && saved.groups && typeof saved.groups === "object" && !Array.isArray(saved.groups)
+      ? saved.groups
+      : {};
+    config.readingMap = {};
+    config.monitorGroupMap = {};
+    for (const [word, entry] of Object.entries(entries)) {
+      if (!word.trim()) continue;
+      const reading = typeof entry === "string" ? entry : entry?.reading;
+      const group = typeof entry === "object" && entry ? entry.group : "";
+      if (typeof reading !== "string" || !reading.trim()) continue;
+      config.readingMap[word] = reading.trim();
+      if (typeof group === "string" && group.trim()) config.monitorGroupMap[word] = group.trim();
+    }
+    config.groupMap = Object.fromEntries(Object.entries(groups).filter(([pattern, name]) => {
+      if (typeof name !== "string" || !name.trim() || pattern.length > 200) return false;
+      try { new RegExp(pattern); return true; } catch { return false; }
+    }));
   } catch (error) {
     if (error.code !== "ENOENT") console.error("Could not load saved reading map", error);
     config.readingMap = defaultReadingMap;
+    config.groupMap = {};
+    config.monitorGroupMap = {};
   }
+}
+
+function structuredReadingEntries() {
+  return Object.fromEntries(Object.entries(config.readingMap).map(([name, reading]) => [name, {
+    reading,
+    group: config.monitorGroupMap[name] || "",
+  }]));
 }
 
 function normalizeAlert(body) {
@@ -382,6 +553,9 @@ function buildSpeechSegments(alert) {
   ];
   if (alert.status === "down") segments.push(canonicalReason(alert.reason));
   segments.push(timeLabel, `${hour}時`, minute === 0 ? "ちょうどです。" : `${minute}分です。`);
+  if (alert.status === "up" && alert.heartbeat?.ping != null && Number.isFinite(Number(alert.heartbeat.ping))) {
+    segments.push(...pingSpeechSegments(alert.heartbeat.ping, "現在の応答時間は、"));
+  }
   return segments;
 }
 
@@ -424,9 +598,17 @@ function applyReadingMap(text) {
   );
 }
 
+function groupNameFor(monitorName) {
+  if (config.monitorGroupMap[monitorName]) return config.monitorGroupMap[monitorName];
+  for (const [pattern, groupName] of Object.entries(config.groupMap)) {
+    if (new RegExp(pattern).test(String(monitorName))) return groupName;
+  }
+  return "";
+}
+
 function enqueueAlertSpeech(alert) {
   if (alert.status !== "down" && alert.status !== "up") {
-    enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert));
+    enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert), buildAlertDisplay(alert));
     return;
   }
   pendingSpeechAlerts.push(alert);
@@ -452,28 +634,33 @@ function flushAlertSpeechBatch() {
     if (alerts.length === 0) continue;
     if (alerts.length < config.batchThreshold) {
       for (const alert of alerts) {
-        enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert));
+        enqueueSpeech(buildSpeech(alert), config.speakerId, buildSpeechSegments(alert), buildAlertDisplay(alert));
       }
       continue;
     }
-    enqueueSpeech(buildBatchSpeech(status, alerts), config.speakerId, buildBatchSpeechSegments(status, alerts));
+    enqueueSpeech(
+      buildBatchSpeech(status, alerts),
+      config.speakerId,
+      buildBatchSpeechSegments(status, alerts),
+      buildBatchDisplay(status, alerts),
+    );
     console.log("Batched " + alerts.length + " " + status + " alerts into one announcement");
   }
 }
 
 function batchBreakdown(alerts) {
-  const rooms = new Map();
-  let otherCount = 0;
+  return batchGroupCounts(alerts).map(({ group, count }) => `${group}、${count}件`);
+}
+
+function batchGroupCounts(alerts) {
+  const groups = new Map();
   for (const alert of alerts) {
     const room = String(alert.name).match(/-V(\d{3,4})-/)?.[1];
-    if (room) rooms.set(room, (rooms.get(room) || 0) + 1);
-    else otherCount += 1;
+    const group = groupNameFor(alert.name) || (room ? `V${Number(room)}教室` : "教室外の機器");
+    groups.set(group, (groups.get(group) || 0) + 1);
   }
-  const details = [...rooms.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([room, count]) => "ブイ" + Number(room) + "教室、" + count + "件");
-  if (otherCount > 0) details.push("教室外の機器、" + otherCount + "件");
-  return details;
+  return [...groups.entries()].sort(([left], [right]) => left.localeCompare(right, "ja"))
+    .map(([group, count]) => ({ group, count }));
 }
 
 function buildBatchSpeech(status, alerts) {
@@ -489,26 +676,112 @@ function buildBatchSpeech(status, alerts) {
 }
 
 function buildBatchSpeechSegments(status, alerts) {
-  const details = batchBreakdown(alerts).map((detail) => detail + "。");
+  const details = batchGroupCounts(alerts).flatMap(({ group, count }) => [`${group}、`, `${count}件。`]);
   if (status === "down") {
-    return ["警告です。障害を" + alerts.length + "件検知しました。", ...details, "詳細は監視画面を確認してください。"];
+    return ["警告です。障害を", `${alerts.length}件。`, "検知しました。", ...details, "詳細は監視画面を確認してください。"];
   }
   const latencies = alerts.map((alert) => Number(alert.heartbeat?.ping)).filter((value) => Number.isFinite(value) && value >= 0);
-  const segments = ["復旧のお知らせです。" + alerts.length + "件の復旧を確認しました。", ...details];
+  const segments = ["復旧のお知らせです。", `${alerts.length}件。`, "の復旧を確認しました。", ...details];
   if (latencies.length > 0) {
     const average = Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length);
-    segments.push("平均応答時間は、" + average + "ミリ秒です。");
+    segments.push(...pingSpeechSegments(average, "平均応答時間は、"));
   }
   return segments;
 }
 
-function enqueueSpeech(text, speakerId = config.speakerId, segments = null) {
-  if (speechQueue.length + generatedAudioQueue.length >= config.maxQueueSize) {
-    console.warn("Speech queue is full; dropping oldest alert");
-    if (speechQueue.length > 0) speechQueue.shift();
-    else generatedAudioQueue.shift();
+const pingNumberReadings = {
+  digits: ["ぜろ", "いち", "に", "さん", "よん", "ご", "ろく", "なな", "はち", "きゅう"],
+  tens: ["", "じゅう", "にじゅう", "さんじゅう", "よんじゅう", "ごじゅう", "ろくじゅう", "ななじゅう", "はちじゅう", "きゅうじゅう"],
+  hundreds: ["", "ひゃく", "にひゃく", "さんびゃく", "よんひゃく", "ごひゃく", "ろっぴゃく", "ななひゃく", "はっぴゃく", "きゅうひゃく"],
+  thousands: ["", "せん", "にせん", "さんぜん", "よんせん", "ごせん", "ろくせん", "ななせん", "はっせん", "きゅうせん"],
+};
+
+function pingSpeechSegments(value, prefix) {
+  const number = Math.max(0, Math.min(9999, Math.round(Number(value))));
+  let remainder = number;
+  const spoken = [];
+  for (const [unit, readings] of [[1000, pingNumberReadings.thousands], [100, pingNumberReadings.hundreds], [10, pingNumberReadings.tens]]) {
+    const digit = Math.floor(remainder / unit);
+    if (digit > 0) spoken.push(readings[digit]);
+    remainder %= unit;
   }
-  speechQueue.push({ text, speakerId, segments });
+  if (remainder > 0) spoken.push(pingNumberReadings.digits[remainder]);
+  if (spoken.length === 0) spoken.push(pingNumberReadings.digits[0]);
+  return [prefix, ...spoken, "ミリ秒です。"];
+}
+
+function pingNumberCachePhrases() {
+  return [...new Set([
+    "現在の応答時間は、", "平均応答時間は、", "ミリ秒です。",
+    ...pingNumberReadings.digits,
+    ...pingNumberReadings.tens.slice(1),
+    ...pingNumberReadings.hundreds.slice(1),
+    ...pingNumberReadings.thousands.slice(1),
+  ])];
+}
+
+function batchCachePhrases() {
+  const groups = new Set([...Object.values(config.groupMap), ...Object.values(config.monitorGroupMap)]);
+  for (const name of Object.keys(config.readingMap)) {
+    const room = name.match(/-V(\d{3,4})-/)?.[1];
+    if (room) groups.add(`V${Number(room)}教室`);
+  }
+  groups.add("教室外の機器");
+  const maxCount = Math.min(30, Math.max(13, kumaMonitors.size, Object.keys(config.readingMap).length));
+  const phrases = [
+    "警告です。障害を",
+    "復旧のお知らせです。",
+    "検知しました。",
+    "の復旧を確認しました。",
+    "詳細は監視画面を確認してください。",
+    "平均応答時間は、",
+  ];
+  for (const group of groups) phrases.push(`${group}、`);
+  for (let count = 1; count <= maxCount; count += 1) {
+    phrases.push(`${count}件。`);
+  }
+  return phrases;
+}
+
+function buildAlertDisplay(alert) {
+  const down = alert.status === "down";
+  const up = alert.status === "up";
+  if (!down && !up) {
+    return { status: alert.status, title: "Uptime Kuma 通知テスト", details: ["音声通知のテスト"] };
+  }
+  const groupName = groupNameFor(alert.name);
+  const details = [];
+  if (groupName) details.push(`グループ: ${groupName}`);
+  details.push(`対象: ${alert.target}`);
+  if (down) details.push(`原因: ${alert.reason}`);
+  if (up && alert.heartbeat?.ping != null) {
+    details.push(`応答時間: ${Math.round(alert.heartbeat.ping)} ms`);
+  }
+  details.push(`${down ? "検知" : "復旧"}時刻: ${alert.time}`);
+  return {
+    status: alert.status,
+    title: `${down ? "障害検知" : "復旧"}：${alert.name}`,
+    details,
+  };
+}
+
+function buildBatchDisplay(status, alerts) {
+  return {
+    status,
+    title: `${status === "down" ? "障害" : "復旧"}を${alerts.length}件${status === "down" ? "検知" : "確認"}`,
+    details: batchBreakdown(alerts),
+  };
+}
+
+function enqueueSpeech(text, speakerId = config.speakerId, segments = null, display = null) {
+  const queuedBeforeEnqueue = speechQueue.length + generatedAudioQueue.length;
+  if (queuedBeforeEnqueue < config.maxQueueSize) queuePressureWarned = false;
+  speechQueue.push({ text, speakerId, segments, display });
+  const queued = speechQueue.length + generatedAudioQueue.length;
+  if (queued >= config.maxQueueSize && !queuePressureWarned) {
+    queuePressureWarned = true;
+    console.warn(`Speech queue has ${queued} announcements; preserving all alerts`);
+  }
   void processSynthesisQueue();
 }
 
@@ -517,18 +790,21 @@ async function processSynthesisQueue() {
   synthesisActive = true;
   try {
     while (speechQueue.length > 0) {
-      const { text, speakerId, segments } = speechQueue.shift();
+      const { text, speakerId, segments, display } = speechQueue.shift();
       try {
         const startedAt = performance.now();
         let wav;
         let cached = false;
         if (segments) {
+          const cacheHits = await Promise.all(segments.map((part) => clipIsCached(part, speakerId)));
+          const misses = segments.filter((_part, index) => !cacheHits[index]);
           const clips = await Promise.all(segments.map((part) => getOrCreateClip(part, speakerId)));
           wav = concatenateWavs(clips);
-          cached = true;
+          cached = misses.length === 0;
+          if (misses.length > 0) console.warn(`Speech cache misses (${misses.length}): ${misses.join(" | ").slice(0, 240)}`);
         }
         if (!wav) wav = await getOrCreateClip(text, speakerId);
-        publishAudio(wav, text);
+        publishAudio(wav, display);
         generatedAudioQueue.push({ wav, text });
         console.log(`${cached ? "Assembled cached audio" : "Synthesized"} in ${Math.round(performance.now() - startedAt)} ms; ready=${generatedAudioQueue.length}`);
         void processPlaybackQueue();
@@ -564,13 +840,13 @@ async function processPlaybackQueue() {
   }
 }
 
-function publishAudio(wav, text) {
+function publishAudio(wav, display = null) {
   const id = String(++audioSequence);
   audioFiles.set(id, wav);
   while (audioFiles.size > 20) audioFiles.delete(audioFiles.keys().next().value);
   const event = JSON.stringify({
     id,
-    text,
+    display,
     url: `/stream/audio/${id}.wav`,
     createdAt: new Date().toISOString(),
   });
@@ -589,77 +865,6 @@ function streamStatus() {
     synthesizing: synthesisActive,
     playing: playbackActive,
   };
-}
-
-function streamPage() {
-  return `<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Uptime Kuma 音声通知</title>
-<style>
-body{margin:0;background:radial-gradient(ellipse at top,#1e293b 0,#0b1120 55%);color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh;padding:24px 0}
-main{width:min(900px,calc(100% - 32px));box-sizing:border-box;background:#111827;border:1px solid #263449;border-radius:22px;padding:32px;box-shadow:0 24px 80px #0008}
-h1{margin:0 0 8px;font-size:27px;letter-spacing:-.03em}.muted{color:#94a3b8}.row{display:flex;gap:12px;align-items:center;margin:20px 0}
-button{border:0;border-radius:10px;padding:11px 16px;background:#22c55e;color:#052e16;font-weight:700;cursor:pointer;font:inherit;font-size:14px;white-space:nowrap;transition:background .15s,transform .15s}button:hover{transform:translateY(-1px)}
-#dot{width:10px;height:10px;border-radius:50%;background:#f59e0b}.ready #dot{background:#22c55e}
-#log{white-space:pre-wrap;background:#111827;padding:16px;border-radius:10px;min-height:72px}audio{width:100%;margin-top:12px}
-section{margin-top:30px;padding:24px;border:1px solid #263449;border-radius:18px;background:linear-gradient(145deg,#172235,#111827 70%)}input{box-sizing:border-box;width:100%;padding:11px 12px;border:1px solid #334155;border-radius:10px;background:#0b1220;color:#f8fafc;outline:none}input:focus{border-color:#818cf8;box-shadow:0 0 0 3px #6366f133}.dict-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.dict-heading h2{margin:0 0 8px;font-size:21px;letter-spacing:-.02em}.dict-heading p{margin:0;max-width:650px;line-height:1.7}.dict-count{flex:none;border:1px solid #334155;background:#0b1220;color:#cbd5e1;border-radius:999px;padding:6px 11px;font-size:12px}.dict-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:20px 0 0;padding:12px;border:1px solid #263449;border-radius:14px;background:#0b1220}.dict-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.dict-actions button{margin:0}.dict-actions .secondary{background:#1e293b;color:#e2e8f0}.dict-actions .secondary:hover{background:#334155}.csv-link{display:inline-flex;align-items:center;border:1px solid #334155;border-radius:10px;padding:10px 14px;color:#cbd5e1;text-decoration:none;font-size:14px;white-space:nowrap}.csv-link:hover{background:#1e293b}.save-button{min-width:132px;background:#6366f1;color:white}.save-button:hover{background:#4f46e5}.dict-status{display:block;min-height:18px;padding:8px 4px;margin:4px 0 10px;color:#a5b4fc;font-size:13px}.dict-status:empty{display:none}.dict-list{overflow-x:auto;border:1px solid #263449;border-radius:12px;background:#0b1220}.dict-head,.dict-row{display:grid;grid-template-columns:minmax(130px,1fr) minmax(150px,1.2fr) 116px 76px 54px;gap:10px;align-items:center}.dict-head{padding:10px 12px;color:#94a3b8;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;background:#111c2e;border-bottom:1px solid #263449}.dict-row{padding:10px 12px;border-bottom:1px solid #1e293b}.dict-row:last-child{border-bottom:0}.dict-row input{min-width:0}.cache-state{white-space:nowrap;font-size:11px;color:#94a3b8}.cache-state.complete{color:#86efac}.preview-button{padding:9px 10px;background:#1e293b;color:#c7d2fe;border:1px solid #334155}.delete-button{padding:9px 10px;background:transparent;color:#fca5a5}.hint{font-size:13px;color:#9ca3af}@media(max-width:680px){body{padding:12px 0}main{padding:20px 14px}.dict-panel{padding:16px 12px} .dict-heading{display:block}.dict-count{display:inline-block;margin-top:12px}.dict-toolbar{align-items:stretch;padding:9px}.dict-actions{width:100%}.dict-actions button,.csv-link{flex:1;justify-content:center;padding:9px 8px;font-size:12px}.save-button{width:100%}.dict-head,.dict-row{grid-template-columns:minmax(95px,1fr) minmax(110px,1fr) 90px 62px 42px;gap:5px;padding-left:7px;padding-right:7px}.dict-row input{padding:8px 6px;font-size:12px}.dict-row button{padding:8px 5px;font-size:11px}.dict-head{font-size:9px}.cache-state{font-size:9px}}
-</style></head><body><main><h1>Uptime Kuma 音声通知</h1><div class="muted">VOICEVOX / Discord VC連携</div>
-<div class="row" id="state"><span id="dot"></span><span id="status">接続中</span></div>
-<button id="start">このページで聞く（ブラウザ再生を有効化）</button><p class="muted">Discord VC接続と、このページで聞くためのブラウザ再生は別設定です。ページ内で音声を聞く場合だけ、最初に一度押してください。</p>
-<div id="log">通知待機中です。</div><audio id="audio" controls></audio>
-<section class="dict-panel"><div class="dict-heading"><div><h2>機器名の読み方</h2><p class="hint">Uptime Kumaの監視名と、読み上げたい名前を登録します。例：<code>router-01</code> → <code>ルーターゼロワン</code>。保存すると障害・復旧の名前音声を準備します。</p></div><span class="dict-count" id="entryCount">辞書</span></div>
-<div class="dict-toolbar"><div class="dict-actions"><button class="secondary" id="loadDict">再読み込み</button><button class="secondary" id="addDict">＋ 単語を追加</button><button class="secondary" id="importCsv">CSVを読み込む</button><input id="csvFile" type="file" accept=".csv,text/csv" hidden><a class="csv-link" href="data:text/csv;charset=utf-8,%EF%BB%BFmonitor_name%2Creading%0Arouter-01%2C%E3%83%AB%E3%83%BC%E3%82%BF%E3%83%BC%E3%82%BC%E3%83%AD%E3%83%AF%E3%83%B3%0A" download="reading-map-template.csv">ひな形</a></div><button class="save-button" id="saveDict">変更を保存</button></div><div id="dictStatus" class="dict-status" role="status" aria-live="polite"></div>
-<div class="dict-list"><div class="dict-head"><span>監視名</span><span>読み上げる名前</span><span>音声キャッシュ</span><span>試聴</span><span></span></div><div id="dictRows"></div></div></section>
-<script>
-const audio=document.querySelector('#audio'),log=document.querySelector('#log'),state=document.querySelector('#state'),status=document.querySelector('#status');let enabled=false,discordReady=false;
-const browserAudioQueue=[];let currentAudioItem=null,autoplayBlocked=false;
-function updatePlaybackStatus(){
-  const connection=discordReady?'Discord VC接続済み':'Discord VC未接続';
-  status.textContent=autoplayBlocked?'再生を開始できません。「このページで聞く」かプレイヤーの再生を押してください':enabled?'ブラウザ再生有効・'+connection+'（'+(currentAudioItem?'再生中・':'')+'待機 '+browserAudioQueue.length+'件）':connection+'（ブラウザ再生待機 '+browserAudioQueue.length+'件）';
-  state.classList.toggle('ready',enabled);
-}
-function releaseAudioItem(item){if(item.objectUrl)URL.revokeObjectURL(item.objectUrl)}
-async function playCurrentAudio(){
-  if(!currentAudioItem)return;
-  const item=currentAudioItem;
-  try{await audio.play();if(currentAudioItem===item){autoplayBlocked=false;updatePlaybackStatus()}}
-  catch(error){if(currentAudioItem===item){autoplayBlocked=true;updatePlaybackStatus()}}
-}
-function playNextAudio(){
-  if(!enabled||currentAudioItem)return;
-  while(browserAudioQueue.length&&browserAudioQueue[0].failed){releaseAudioItem(browserAudioQueue.shift())}
-  if(!browserAudioQueue.length||!browserAudioQueue[0].ready){updatePlaybackStatus();return}
-  currentAudioItem=browserAudioQueue.shift();log.textContent=currentAudioItem.text;audio.src=currentAudioItem.objectUrl;updatePlaybackStatus();void playCurrentAudio();
-}
-function finishCurrentAudio(){
-  if(!currentAudioItem)return;
-  releaseAudioItem(currentAudioItem);currentAudioItem=null;autoplayBlocked=false;playNextAudio();updatePlaybackStatus();
-}
-function enqueueBrowserAudio(item){browserAudioQueue.push(item);updatePlaybackStatus();playNextAudio()}
-audio.addEventListener('ended',finishCurrentAudio);
-audio.addEventListener('error',()=>{if(currentAudioItem){log.textContent='音声を再生できませんでした。'+currentAudioItem.text;finishCurrentAudio()}});
-audio.addEventListener('play',()=>{autoplayBlocked=false;updatePlaybackStatus()});
-document.querySelector('#start').onclick=()=>{enabled=true;updatePlaybackStatus();if(currentAudioItem)void playCurrentAudio();else playNextAudio()};
-const events=new EventSource('/stream/events');
-events.addEventListener('status',e=>{discordReady=JSON.parse(e.data).discordReady;updatePlaybackStatus()});
-events.addEventListener('audio',e=>{
-  const item={...JSON.parse(e.data),ready:false,failed:false};enqueueBrowserAudio(item);
-  // Fetch immediately so waiting notifications survive eviction from the server's short audio cache.
-  fetch(item.url).then(response=>{if(!response.ok)throw new Error('Audio download failed');return response.blob()}).then(blob=>{item.objectUrl=URL.createObjectURL(blob);item.ready=true;playNextAudio()}).catch(error=>{item.failed=true;playNextAudio()});
-});
-events.onerror=()=>{status.textContent='再接続中（待機 '+browserAudioQueue.length+'件）';state.classList.remove('ready')};
-const rows=document.querySelector('#dictRows'),dictStatus=document.querySelector('#dictStatus'),entryCount=document.querySelector('#entryCount');
-function updateEntryCount(){entryCount.textContent=rows.children.length+'件'}
-function addRow(word='',reading='',cache={}){const row=document.createElement('div');row.className='dict-row';const wordInput=document.createElement('input');wordInput.value=word;wordInput.placeholder='例：router-01';const readingInput=document.createElement('input');readingInput.value=reading;readingInput.placeholder='例：ルーターゼロワン';const state=document.createElement('span');state.className='cache-state';const refreshState=()=>{state.textContent='障害 '+(cache.down?'✓':'–')+' / 復旧 '+(cache.up?'✓':'–');state.classList.toggle('complete',cache.down&&cache.up)};refreshState();readingInput.oninput=()=>{cache={down:false,up:false};refreshState()};const preview=document.createElement('button');preview.className='preview-button';preview.textContent='▶';preview.title='障害通知の名前部分を試聴';preview.setAttribute('aria-label','読み上げを試聴');preview.onclick=async()=>{if(!readingInput.value.trim()){dictStatus.textContent='先に読み上げる名前を入力してください';return}try{dictStatus.textContent='試聴音声を準備中…';const response=await fetch('/api/reading-map/preview?reading='+encodeURIComponent(readingInput.value.trim()));if(!response.ok)throw new Error('試聴音声を作成できませんでした');const objectUrl=URL.createObjectURL(await response.blob());enqueueBrowserAudio({text:'読み方の試聴：'+readingInput.value.trim(),objectUrl,ready:true});cache.down=true;refreshState();dictStatus.textContent='試聴音声を再生待ちに追加しました'}catch(error){dictStatus.textContent=error.message}};const remove=document.createElement('button');remove.className='delete-button';remove.textContent='×';remove.title='この単語を削除';remove.setAttribute('aria-label','この単語を削除');remove.onclick=()=>{row.remove();updateEntryCount()};row.append(wordInput,readingInput,state,preview,remove);rows.append(row);updateEntryCount()}
-async function dictRequest(method='GET',body){const response=await fetch('/api/reading-map',{method,headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});const data=await response.json();if(!response.ok)throw new Error(data.error||'辞書の操作に失敗しました');return data}
-document.querySelector('#loadDict').onclick=async()=>{try{dictStatus.textContent='読み込み中…';const data=await dictRequest();rows.replaceChildren();Object.entries(data.entries).sort(([a],[b])=>a.localeCompare(b,'ja')).forEach(([word,reading])=>addRow(word,reading,data.cacheStatus[word]));dictStatus.textContent=Object.keys(data.entries).length+'件読み込みました'}catch(error){dictStatus.textContent=error.message}};
-document.querySelector('#addDict').onclick=()=>addRow();
-function parseCsv(text){const records=[];let row=[],field='',quoted=false;for(let i=0;i<text.length;i++){const ch=text[i];if(quoted){if(ch==='"'&&text[i+1]==='"'){field+='"';i++}else if(ch==='"')quoted=false;else field+=ch}else if(ch==='"'&&field==='')quoted=true;else if(ch===','){row.push(field);field=''}else if(ch==='\\n'||ch==='\\r'){if(ch==='\\r'&&text[i+1]==='\\n')i++;row.push(field);if(row.some(cell=>cell.trim()))records.push(row);row=[];field=''}else field+=ch}if(quoted)throw new Error('CSVの引用符が閉じられていません');if(field||row.length){row.push(field);if(row.some(cell=>cell.trim()))records.push(row)}return records}
-document.querySelector('#importCsv').onclick=()=>document.querySelector('#csvFile').click();
-document.querySelector('#csvFile').onchange=async event=>{const file=event.target.files[0];if(!file)return;try{const records=parseCsv((await file.text()).replace(/^\\uFEFF/,''));if(records.length<2)throw new Error('CSVにデータ行がありません');const header=records.shift().map(value=>value.trim().toLowerCase());const keyIndex=header.findIndex(value=>['monitor_name','監視名','uptime kumaの監視名'].includes(value));const readingIndex=header.findIndex(value=>['reading','読み方','読み上げる名前'].includes(value));if(keyIndex<0||readingIndex<0)throw new Error('ヘッダーは monitor_name,reading（または 監視名,読み方）にしてください');const entries=records.map(row=>[row[keyIndex]?.trim()||'',row[readingIndex]?.trim()||'']).filter(([key,reading])=>key&&reading);if(!entries.length)throw new Error('有効な監視名と読み方が見つかりません');rows.replaceChildren();entries.forEach(([key,reading])=>addRow(key,reading));dictStatus.textContent=entries.length+'件を一覧に読み込みました。内容を確認して「保存」を押してください'}catch(error){dictStatus.textContent=error.message}finally{event.target.value=''}};
-document.querySelector('#saveDict').onclick=async()=>{const entries={};for(const row of rows.children){const [word,reading]=row.querySelectorAll('input');if(word.value.trim()||reading.value.trim()){if(!word.value.trim()||!reading.value.trim()){dictStatus.textContent='単語と読み方の両方を入力してください';return}entries[word.value.trim()]=reading.value.trim()}}try{dictStatus.textContent='保存・音声準備中…';const data=await dictRequest('PUT',{entries});rows.replaceChildren();Object.entries(data.entries).sort(([a],[b])=>a.localeCompare(b,'ja')).forEach(([word,reading])=>addRow(word,reading,data.cacheStatus[word]));dictStatus.textContent='保存しました（'+Object.keys(data.entries).length+'件）'}catch(error){dictStatus.textContent=error.message}};
-document.querySelector('#loadDict').click();
-</script></main></body></html>`;
 }
 
 async function synthesize(text, speakerId = config.speakerId) {
@@ -763,6 +968,8 @@ async function warmSpeechCache() {
     phrases.add(`警告です。${name}で障害を検知しました。`);
     phrases.add(`復旧です。${name}は正常な状態に戻りました。`);
   }
+  for (const phrase of batchCachePhrases()) phrases.add(phrase);
+  for (const phrase of pingNumberCachePhrases()) phrases.add(phrase);
   const list = [...phrases];
   cacheWarmup = { done: 0, total: list.length, ready: false };
   for (const phrase of list) {

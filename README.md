@@ -1,6 +1,6 @@
 # Uptime Kuma Discord Voice Alerts
 
-Uptime Kuma の Webhook 通知を VOICEVOX で音声化し、Discord のボイスチャンネルへ読み上げるセルフホスト用サービスです。ブラウザー用の `/Stream` ページ、読み上げ辞書、CSV インポートにも対応しています。
+Uptime Kuma の Webhook 通知を VOICEVOX で音声化し、Discord のボイスチャンネルへ読み上げるセルフホスト用サービスです。ブラウザー用の `/Stream` ページとJSON形式の読み上げ辞書に対応しています。
 
 ## Features
 
@@ -9,7 +9,7 @@ Uptime Kuma の Webhook 通知を VOICEVOX で音声化し、Discord のボイ�
 - VOICEVOX EngineをDocker Composeで起動
 - `/Stream` ページで通知の確認、ブラウザー再生、読み上げ辞書の編集
 - 監視名ごとの発音を保存し、障害・復旧フレーズを事前生成
-- 読み上げ辞書のCSVインポート
+- 読み上げ辞書のJSON編集・読み込み・ダウンロード
 - Webhookトークンによる通知リクエストの認証
 - 短時間に届いた障害・復旧通知の一括読み上げ
 - ブラウザー再生の通知キューイング
@@ -23,7 +23,7 @@ Uptime Kuma -- Webhook --> Bot -- VOICEVOX --> generated speech
                                +--> /Stream browser
 ```
 
-Uptime Kuma は監視の状態、監視名、エラー情報、時刻をWebhookで送信します。Botは名前を読み上げ辞書で変換し、保存済み音声部品を組み立てて読み上げます。音声キャッシュと辞書はDockerの名前付きボリュームに保存されます。
+Uptime Kuma は監視の状態、監視名、エラー情報、時刻をWebhookで送信します。Botは名前を読み上げ辞書で変換し、キャッシュした音声部品を組み立てて読み上げます。辞書と音声キャッシュはDockerの名前付きボリュームに保存されます。
 
 ## Requirements
 
@@ -81,27 +81,54 @@ Botは標準Webhookの `monitor`、`heartbeat`、`msg` フィールドを読み�
 
 障害・復旧通知は短い時間窓に集め、同じ状態の通知がしきい値以上あれば一つの音声にまとめます。同じ監視対象の状態が時間窓内に複数回変わった場合は、最後の状態を使います。障害と復旧は別々にまとめ、しきい値に達しない通知は個別に読み上げます。Discordのテキスト通知はすぐに個別送信されます。
 
-一括通知は監視名に含まれる `-V123-` 形式などの教室番号ごとに件数を読み上げます。形式に合わない監視名は「教室外の機器」としてまとめます。復旧通知では、応答時間が得られる場合に平均値も読み上げます。再生中の音声は中断せず、要約は通常の再生キューに入ります。
+一括通知はグループ名ごとに件数を読み上げます。対象ごとにグループ名を設定できます。未設定の場合は、監視名の `-V123-` 形式から教室番号をまとめます。復旧通知では対象ごとの応答時間を読み上げ、一括復旧では平均応答時間も読み上げます。PINGの数値はキャッシュ済みの日本語の位読み音声を組み立てます。再生中の音声は中断せず、要約は通常の再生キューに入ります。
 
 時間窓としきい値は `.env` の `ALERT_BATCH_WINDOW_SECONDS`（既定5秒）と `ALERT_BATCH_THRESHOLD`（既定3件）で変更できます。
+`MAX_QUEUE_SIZE`（既定30）はキュー混雑の警告基準です。到着した通知はキュー上限で破棄しません。
 
 ## Stream page and pronunciation dictionary
 
 既定ではStream UIをホストの `127.0.0.1:3100` にだけ公開します。
 
-- Local: `http://localhost:3100/Stream`
+- Operations: `http://localhost:3100/stream`
+- Pronunciation dictionary: `http://localhost:3100/stream/dictionary`
 - Health: `http://localhost:3100/health`
 
 LAN上のブラウザーから開きたい場合は `.env` の `STREAM_BIND_ADDRESS` を `0.0.0.0` にし、ファイアウォールで信頼できるLANからのアクセスだけを許可してください。Stream UIの辞書APIはローカル運用を想定し、Webhookトークン認証を行いません。インターネットへ直接公開しないでください。
 
-辞書の左列にはUptime Kuma上の監視名、右列には読み上げたい表記を登録します。保存すると、その読みの障害・復旧用音声が事前生成されます。CSVは `monitor_name,reading` または `監視名,読み方` の列名に対応しています。
+Streamは運用画面と読み上げ辞書の管理画面に分かれています。運用画面には通知状態、再生状態、直近の通知履歴だけを表示します。辞書の編集・同期・試聴は `/stream/dictionary` で行います。運用画面の通知欄には監視名、対象、原因、時刻を表示し、VOICEVOX向けの読み上げ文は音声合成にだけ使います。
 
-```csv
-monitor_name,reading
-router-01,ルーター ゼロワン
+ブラウザー音声は SSE で通知を受け取り、HTTP WAV をダウンロードして順番に再生します。ブラウザー側で再生を有効にしたあと、切断時は EventSource が自動で再接続します。
+
+辞書JSONは `groups` と `entries` で管理します。`entries` は監視名をキーにし、各値に `reading`（読み上げる表記）と `group`（対象のグループ名）を設定します。`group` は画面表示と一括通知の集約に使います。`groups` は任意で、監視名に適用するJavaScript正規表現をキー、既定のグループ名を値にします。正規表現ルールはJSON内の記載順で評価し、監視対象ごとの `group` が優先されます。`/stream/dictionary` のJSON欄で直接編集し、「JSONを保存」を押すと障害・復旧用音声を準備します。以前の「監視名: 読み」形式も読み込めます。
+
+```json
+{
+  "groups": {
+    "^CK-.*-V101-": "第101教室"
+  },
+  "entries": {
+    "CK-AP-V001-1": {
+      "reading": "アクセスポイント ブイゼロゼロイチ いち",
+      "group": "教室１０１"
+    }
+  }
+}
 ```
 
-CSVを読み込んだ後、内容を確認して「変更を保存」を押してください。
+Uptime Kumaの全監視対象一覧を同期する場合は、`.env` に `KUMA_SOCKET_URL`、`KUMA_USERNAME`、`KUMA_PASSWORD` を設定し、Stream画面の「監視対象を同期」を押してください。BotはSocket.IOの一覧・追加・削除イベントを受け取り、画面上で未登録名だけを読み方の候補として追加します。候補は監視名を初期読みとして表示するため、読み方を確認して保存してください。保存時に障害・復旧音声キャッシュを生成します。監視対象が削除されても辞書から自動削除しません。
+
+この同期はUptime Kuma 2.5.5で確認した内部Socket.IO APIを使います。Uptime Kuma側の変更で動かなくなる可能性があります。同期専用のアカウントを使い、2段階認証を無効にしてください（このクライアントは2FAログインに対応しません）。パスワードはBotの `.env` にだけ保存し、Stream画面やAPI応答には返しません。同期が不要なら3つの設定を空欄にできます。
+
+旧形式の辞書ファイルも読み込めます。
+
+```json
+{
+  "router-01": "ルーター ゼロワン"
+}
+```
+
+JSONファイルを読み込んだ後、内容を確認して「JSONを保存」を押してください。
 
 ## Configuration
 
@@ -114,6 +141,8 @@ CSVを読み込んだ後、内容を確認して「変更を保存」を押し�
 | `DISCORD_TEXT_CHANNEL_ID` | 任意のEmbed通知先テキストチャンネル |
 | `WEBHOOK_TOKEN` | Uptime Kumaからの通知を認証する秘密値 |
 | `KUMA_DOCKER_NETWORK` | Kumaと共有するDockerネットワーク名 |
+| `KUMA_SOCKET_URL` | 監視一覧同期用のUptime Kuma URL（任意） |
+| `KUMA_USERNAME` / `KUMA_PASSWORD` | 監視一覧同期用アカウント（任意） |
 | `STREAM_BIND_ADDRESS` | Stream UIのホスト側バインドアドレス（既定 `127.0.0.1`） |
 | `STREAM_PORT` | Stream UIのホスト側ポート（既定 `3100`） |
 | `VOICEVOX_SPEAKER_ID` | VOICEVOX speaker/style ID（既定 `3`） |
