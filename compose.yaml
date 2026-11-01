@@ -1,5 +1,5 @@
 services:
-  kuma-slack-tts-bot:
+  discord-tts-bot:
     build: .
     restart: unless-stopped
     env_file: .env
