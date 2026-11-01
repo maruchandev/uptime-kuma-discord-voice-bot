@@ -1,11 +1,12 @@
-# Uptime Kuma Discord Voice Alerts
+# Uptime Kuma Slack and Discord Voice Alerts
 
-Uptime Kuma の Webhook 通知を VOICEVOX で音声化し、Discord のボイスチャンネルへ読み上げるセルフホスト用サービスです。ブラウザー用の `/Stream` ページとJSON形式の読み上げ辞書に対応しています。
+Uptime Kuma の Webhook 通知を Slack へ送り、必要に応じて VOICEVOX で音声化して Discord のボイスチャンネルへ読み上げるセルフホスト用サービスです。ブラウザー用の `/Stream` ページとJSON形式の読み上げ辞書に対応しています。
 
 ## Features
 
 - Discord ボイスチャンネルへの障害・復旧通知の読み上げ
 - 任意でDiscordテキストチャンネルへEmbed通知
+- 任意でSlackチャンネルへ通知（Slack Incoming Webhook）
 - VOICEVOX EngineをDocker Composeで起動
 - `/Stream` ページで通知の確認、ブラウザー再生、読み上げ辞書の編集
 - 監視名ごとの発音を保存し、障害・復旧フレーズを事前生成
@@ -20,6 +21,7 @@ Uptime Kuma の Webhook 通知を VOICEVOX で音声化し、Discord のボイ�
 Uptime Kuma -- Webhook --> Bot -- VOICEVOX --> generated speech
                                |                    |
                                +--> Discord VC <----+
+                               +--> Slack channel
                                +--> /Stream browser
 ```
 
@@ -30,20 +32,21 @@ Uptime Kuma は監視の状態、監視名、エラー情報、時刻をWebhook�
 - Docker Engine と Docker Compose v2
 - 稼働中の Uptime Kuma
 - DiscordアプリケーションとBot（ボイスチャンネルへ接続する場合）
+- Slack Incoming Webhook（Slackへ通知する場合）
 
 ## Setup
 
 1. このリポジトリを取得し、設定ファイルを作ります。
 
    ```sh
-   git clone https://github.com/maruchandev/uptime-kuma-discord-voice-bot.git
-   cd uptime-kuma-discord-voice-bot
+   git clone https://github.com/maruchandev/uptime-kuma-discord-voice-bot.git uptime-kuma-slack-bot
+   cd uptime-kuma-slack-bot
    cp .env.example .env
    ```
 
-2. `.env` を編集します。最低限 `WEBHOOK_TOKEN` を長くランダムな値に設定してください。Discordのボイス読み上げを使う場合は `DISCORD_BOT_TOKEN` と `DISCORD_VOICE_CHANNEL_ID` も設定します。サーバーIDはボイスチャンネルから自動判定されます。テキストチャンネルへの通知が不要なら `DISCORD_TEXT_CHANNEL_ID` は空欄のままにします。
+2. `.env` を編集します。最低限 `WEBHOOK_TOKEN` を長くランダムな値に設定してください。Slackへ通知する場合はSlackでIncoming Webhookを作成し、`SLACK_WEBHOOK_URL` に設定します。Discordのボイス読み上げを使う場合は `DISCORD_BOT_TOKEN` と `DISCORD_VOICE_CHANNEL_ID` も設定します。サーバーIDはボイスチャンネルから自動判定されます。テキストチャンネルへの通知が不要なら `DISCORD_TEXT_CHANNEL_ID` は空欄のままにします。
 
-3. BotをDiscordサーバーへ招待し、対象チャンネルで `View Channel`、`Connect`、`Speak` を許可します。テキスト通知を使う場合は `Send Messages` と `Embed Links` も許可してください。Botは `GuildVoiceStates` Gateway intentを使用し、Message Content intentは使用しません。
+3. Discordの音声・テキスト通知を使う場合はBotをDiscordサーバーへ招待し、対象チャンネルの権限を設定します。Slack通知だけを使う場合、この手順は不要です。
 
 4. Kumaとこのサービスが共有するDockerネットワークを用意します。ネットワーク名は `.env` の `KUMA_DOCKER_NETWORK` と一致させてください。
 
@@ -64,7 +67,7 @@ Uptime Kuma は監視の状態、監視名、エラー情報、時刻をWebhook�
 
 Uptime Kumaで `Webhook` 通知先を追加し、監視対象に割り当てます。
 
-- URL: `http://discord-tts-bot:3000/alert`
+- URL: `http://kuma-slack-tts-bot:3000/alert`
 - Method: `POST`
 - Body: `application/json`（Uptime Kumaの標準Webhook形式）
 - Additional Headers:
@@ -139,6 +142,7 @@ JSONファイルを読み込んだ後、内容を確認して「JSONを保存」
 | `DISCORD_BOT_TOKEN` | Discord Bot token |
 | `DISCORD_VOICE_CHANNEL_ID` | 読み上げ先ボイスチャンネル |
 | `DISCORD_TEXT_CHANNEL_ID` | 任意のEmbed通知先テキストチャンネル |
+| `SLACK_WEBHOOK_URL` | 任意のSlack Incoming Webhook URL。Discord設定なしでもSlack通知を有効化 |
 | `WEBHOOK_TOKEN` | Uptime Kumaからの通知を認証する秘密値 |
 | `KUMA_DOCKER_NETWORK` | Kumaと共有するDockerネットワーク名 |
 | `KUMA_SOCKET_URL` | 監視一覧同期用のUptime Kuma URL（任意） |
@@ -153,7 +157,7 @@ JSONファイルを読み込んだ後、内容を確認して「JSONを保存」
 ## Maintenance
 
 ```sh
-docker compose logs -f discord-tts-bot
+docker compose logs -f kuma-slack-tts-bot
 docker compose ps
 docker compose down
 ```

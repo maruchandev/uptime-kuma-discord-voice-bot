@@ -35,6 +35,7 @@ const config = {
   port: numberEnv("PORT", 3000),
   guildId: process.env.DISCORD_GUILD_ID,
   textChannelId: process.env.DISCORD_TEXT_CHANNEL_ID,
+  slackWebhookUrl: process.env.SLACK_WEBHOOK_URL || "",
   voiceChannelId: process.env.DISCORD_VOICE_CHANNEL_ID,
   webhookToken: process.env.WEBHOOK_TOKEN,
   voicevoxUrl: process.env.VOICEVOX_URL || "http://voicevox:50021",
@@ -60,6 +61,7 @@ const discordEnabled = [
   process.env.DISCORD_BOT_TOKEN,
   config.voiceChannelId,
 ].every(Boolean);
+const slackEnabled = Boolean(config.slackWebhookUrl);
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -127,6 +129,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     discordEnabled,
+    slackEnabled,
     discord: client.isReady(),
     voice: voiceConnection?.state.status || "not-created",
     queue: speechQueue.length + generatedAudioQueue.length,
@@ -268,11 +271,12 @@ app.post("/alert", authenticateWebhook, async (req, res) => {
 
   try {
     if (textChannel) await textChannel.send({ embeds: [buildEmbed(alert)] });
+    if (slackEnabled) await sendSlackAlert(alert);
     enqueueAlertSpeech(alert);
     res.status(202).json({ accepted: true, batching: true });
   } catch (error) {
     console.error("Alert handling failed", error);
-    res.status(502).json({ error: "Discord delivery failed" });
+    res.status(502).json({ error: "Alert delivery failed" });
   }
 });
 
@@ -524,6 +528,34 @@ function buildEmbed(alert) {
     embed.addFields({ name: "説明", value: truncate(String(alert.monitor.description), 1024), inline: false });
   }
   return embed;
+}
+
+async function sendSlackAlert(alert) {
+  const down = alert.status === "down";
+  const up = alert.status === "up";
+  const title = down ? `🚨 障害検知：${alert.name}` : up ? `✅ 復旧：${alert.name}` : "🔊 通知テスト";
+  const lines = [
+    `*${slackEscape(title)}*`,
+    `状態: ${down ? "障害" : up ? "正常" : "テスト"}`,
+    `監視方式: ${slackEscape(String(alert.monitor.type || "不明"))}`,
+    `対象: ${slackEscape(alert.target)}`,
+    `確認時刻: ${slackEscape(alert.time)}`,
+  ];
+  if (down) lines.push(`原因: ${slackEscape(alert.reason)}`);
+  if (up && alert.heartbeat?.ping != null) lines.push(`応答時間: ${Math.round(alert.heartbeat.ping)} ms`);
+  if (alert.monitor.description) lines.push(`説明: ${slackEscape(String(alert.monitor.description))}`);
+
+  const response = await fetch(config.slackWebhookUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: lines.join("\n") }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) throw new Error(`Slack webhook HTTP ${response.status}`);
+}
+
+function slackEscape(value) {
+  return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 function buildSpeech(alert) {
