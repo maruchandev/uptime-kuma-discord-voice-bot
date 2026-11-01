@@ -301,7 +301,11 @@ app.listen(config.port, "0.0.0.0", () => {
 connectKumaMonitorSync();
 
 if (discordEnabled) {
-  await client.login(process.env.DISCORD_BOT_TOKEN);
+  try {
+    await client.login(process.env.DISCORD_BOT_TOKEN);
+  } catch (error) {
+    console.error("Discord login failed; Stream and webhook mode will continue. Check DISCORD_BOT_TOKEN.", error.message);
+  }
 } else {
   console.warn("Discord settings are incomplete; /stream mode only");
 }
